@@ -1,0 +1,184 @@
+version: 2.1
+orbs:
+  aws-s3: circleci/aws-s3@3.1.1
+
+defaults: &defaults
+  working_directory: /tmp/mui-toolpad
+  resource_class: medium
+  docker:
+    - image: cimg/node:18.10.0
+# CircleCI has disabled the cache across forks for security reasons.
+# Following their official statement, it was a quick solution, they
+# are working on providing this feature back with appropriate security measures.
+# https://discuss.circleci.com/t/saving-cache-stopped-working-warning-skipping-this-step-disabled-in-configuration/24423/21
+#
+# restore_repo: &restore_repo
+#   restore_cache:
+#     key: v1-repo-{{ .Branch }}-{{ .Revision }}
+
+commands:
+  install_js:
+    parameters:
+      browsers:
+        type: boolean
+        default: true
+        description: 'Set to true if you intend to use any browser (e.g. with playwright).'
+
+    steps:
+      - run:
+          name: View install environment
+          command: |
+            node --version
+            yarn --version
+      - restore_cache:
+          name: Restore yarn cache
+          keys:
+            - v11-yarn-{{ checksum "yarn.lock" }}
+            - v0-next-{{ checksum "yarn.lock" }}
+      - run:
+          name: Set yarn cache folder
+          command: |
+            # Keep path in sync with `save_cache` for key "v8-yarn-"
+            yarn config set cache-folder /tmp/yarn-cache
+            # Debug information
+            yarn cache dir
+            yarn cache list
+      - when:
+          condition: << parameters.browsers >>
+          steps:
+            - run:
+                name: Prepare playwright hash
+                command: yarn --json list --pattern playwright > /tmp/playwright_info.json
+            - store_artifacts:
+                name: Debug playwright hash
+                path: /tmp/playwright_info.json
+            - restore_cache:
+                name: Restore playwright cache
+                keys:
+                  - v5-playwright-{{ arch }}-{{ checksum "/tmp/playwright_info.json" }}
+      - run:
+          name: Install js dependencies
+          command: yarn install
+          environment:
+            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: <<# parameters.browsers >>0<</ parameters.browsers >><<^ parameters.browsers >>1<</ parameters.browsers >>
+
+      - save_cache:
+          name: Save yarn cache
+          key: v11-yarn-{{ checksum "yarn.lock" }}
+          paths:
+            # Keep path in sync with "Set yarn cache folder"
+            # Can't use environment variables for `save_cache` paths (tested in https://app.circleci.com/pipelines/github/mui/material-ui/37813/workflows/5b1e207f-ac8b-44e7-9ba4-d0f9a01f5c55/jobs/223370)
+            - /tmp/yarn-cache
+      - when:
+          condition: << parameters.browsers >>
+          steps:
+            - save_cache:
+                name: Save playwright cache
+                key: v5-playwright-{{ arch }}-{{ checksum "/tmp/playwright_info.json" }}
+                paths:
+                  # Keep path in sync with "PLAYWRIGHT_BROWSERS_PATH"
+                  # Can't use environment variables for `save_cache` paths (tested in https://app.circleci.com/pipelines/github/mui/material-ui/37813/workflows/5b1e207f-ac8b-44e7-9ba4-d0f9a01f5c55/jobs/223370)
+                  - /tmp/pw-browsers
+
+jobs:
+  checkout:
+    <<: *defaults
+    docker:
+      - image: cimg/node:18.10.0
+        environment:
+          TOOLPAD_SHADOW_DATABASE_URL: postgresql://postgres@localhost/circle_test
+    steps:
+      - checkout
+      - install_js
+      - run:
+          name: Should not have any git not staged
+          command: git diff --exit-code
+      - run:
+          name: Check for duplicated packages
+          command: yarn deduplicate
+
+  test_lint:
+    <<: *defaults
+    steps:
+      - checkout
+      - install_js
+      - run:
+          name: Eslint
+          command: yarn eslint
+      - run:
+          name: Lint JSON
+          command: yarn jsonlint
+      - run:
+          name: Lint Markdown
+          command: yarn markdownlint
+  test_types:
+    <<: *defaults
+    steps:
+      - checkout
+      - install_js
+      - run:
+          name: Check Typescript types
+          command: yarn check-types
+  test_static:
+    <<: *defaults
+    steps:
+      - checkout
+      - install_js
+      - run:
+          name: '`yarn prettier` changes committed?'
+          command: yarn prettier --check
+      - run:
+          name: '`yarn jsonSchemas` changes committed?'
+          command: |
+            yarn jsonSchemas
+            git diff --exit-code
+
+  test_unit:
+    <<: *defaults
+    resource_class: 'large'
+    docker:
+      - image: mcr.microsoft.com/playwright:v1.33.0-focal
+        environment:
+          NODE_ENV: test
+          TOOLPAD_TEST_RETRIES: 1
+      - image: kennethreitz/httpbin:latest
+
+    steps:
+      - checkout
+      - install_js
+      - run:
+          name: 'Build packages'
+          command: yarn release:build
+      - save_cache:
+          name: Save Next.js cache
+          key: v0-next-{{ checksum "yarn.lock" }}
+          paths:
+            - packages/toolpad-app/.next/cache
+      - run:
+          name: Tests fake browser
+          command: yarn test
+      - run:
+          name: Tests real browser
+          environment:
+            HTTPBIN_BASEURL: 'http://localhost/'
+          command: yarn test:integration
+      - store_artifacts:
+          path: test-results
+          destination: playwright-test-results
+
+workflows:
+  pipeline:
+    jobs:
+      - checkout
+      - test_lint:
+          requires:
+            - checkout
+      - test_types:
+          requires:
+            - checkout
+      - test_static:
+          requires:
+            - checkout
+      - test_unit:
+          requires:
+            - checkout
